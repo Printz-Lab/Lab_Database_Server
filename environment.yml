@@ -1,0 +1,14 @@
+name: Streamlit
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - matplotlib
+  - openpyxl
+  - numpy
+  - pandas
+  - scipy
+  - lmfit
+  - streamlit
+  - pip

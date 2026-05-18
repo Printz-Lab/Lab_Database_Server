@@ -1,0 +1,124 @@
+---
+name: <APP WRAPPED>
+services:
+    # Nginx reverse proxy - Required
+    nginx:
+        restart: always
+        image: nginx:mainline-alpine
+        ports:
+            - 801:80
+            - 4431:443
+        command: [nginx-debug, '-g', 'daemon off;']
+        volumes:
+            - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf
+            - static:/app/backend/static
+            - certs:/etc/nginx/ssl
+        networks:
+         - <APP WRAPPED NET>
+    # Gunicorn server - Required
+    app-server:
+        restart: unless-stopped
+        build:
+            context: .
+            dockerfile: ./docker/backend/Dockerfile
+        entrypoint: /app/docker/backend/server-entrypoint.sh
+        volumes:
+            - static:/app/backend/static
+            - backend:/app/backend
+            - docker:/app/docker
+        expose:
+            - 8001   
+        ports:
+          - 8001:8000
+        environment:
+            DEBUG: "True"
+            #CELERY_BROKER_URL: "redis://redis:6379/0"
+            #CELERY_RESULT_BACKEND: "redis://redis:6379/0"
+            DJANGO_DB: postgresql
+            POSTGRES_HOST: db
+            POSTGRES_NAME: postgres
+            POSTGRES_USER: postgres
+            POSTGRES_PASSWORD: postgres
+            POSTGRES_PORT: 5432
+        networks:
+         - <APP WRAPPED NET>
+    # Celery Worker - Optional
+    worker:
+        restart: unless-stopped
+        build:
+            context: .
+            dockerfile: ./docker/backend/Dockerfile
+        container_name: worker
+        entrypoint: /app/docker/backend/worker-entrypoint.sh
+        volumes:
+            - backend:/app/backend
+            - static:/app/backend/static
+            - docker:/app/docker
+        environment:
+            DEBUG: "True"
+            CELERY_BROKER_URL: "redis://redis:6379/0"
+            CELERY_RESULT_BACKEND: "redis://redis:6379/0"
+            DJANGO_DB: postgresql
+            POSTGRES_HOST: db
+            POSTGRES_NAME: postgres
+            POSTGRES_USER: postgres
+            POSTGRES_PASSWORD: postgres
+            POSTGRES_PORT: 5432
+        depends_on:
+            - app_server
+            - redis
+        networks:
+         - <APP WRAPPED NET>
+    redis:
+        restart: unless-stopped
+        image: redis:7.0.5-alpine 
+        container_name: redis
+        expose:
+            - 6379
+        networks:
+         - <APP WRAPPED NET>
+    db:
+        image: postgres:13.0-alpine
+        container_name: db
+        restart: unless-stopped
+        volumes:
+            - postgres:/var/lib/postgresql/data/
+        environment:
+            POSTGRES_DB: postgres
+            POSTGRES_USER: postgres
+            POSTGRES_PASSWORD: postgres
+        expose:
+            - 5432
+        networks:
+         - <APP WRAPPED NET>
+volumes:
+    backend:
+        driver: local
+        driver_opts:
+            type: none
+            o: bind
+            device: "${PWD}/backend"
+    docker:
+        driver: local
+        driver_opts:
+            type: none
+            o: bind
+            device: "${PWD}/docker"
+    static: 
+        driver: local
+        driver_opts:
+            type: none
+            o: bind
+            device: "${PWD}/static"
+    certs: 
+        driver: local
+        driver_opts:
+            type: none
+            o: bind
+            device: "${PWD}/certs"
+    postgres: {}
+
+networks:
+  <APP WRAPPED NET>:
+    name: <APP WRAPPED NET>
+    driver: bridge

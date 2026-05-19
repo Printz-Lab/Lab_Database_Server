@@ -66,6 +66,9 @@ def load_manifests(root_str: str) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[
             samples = pd.read_sql_query("SELECT * FROM samples", con).fillna("")
             experiments = pd.read_sql_query("SELECT experiment_id, sample_id, measurement_type, experiment_subtype, source_label, source_file, raw_data_path, processed_data_path, fit_parameters_path FROM experiments", con).fillna("")
             con.close()
+            for col in ["formulation", "batch", "notes"]:
+                if col not in experiments.columns:
+                    experiments[col] = ""
             return samples, experiments, None
         except Exception as exc:
             return pd.DataFrame(), pd.DataFrame(), f"SQLite load failed: {exc}"

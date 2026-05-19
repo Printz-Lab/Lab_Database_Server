@@ -73,11 +73,22 @@ pip install -r requirements.txt
 
 ### Standardize Data
 
-python standardize_lab_optics_data_uvvis_append.py
+python standardize_lab_optics_data.py
+
+### GUI (cross-platform)
+
+The standardizer now uses a **PySide6 (Qt)** desktop GUI, which is compatible with Linux (including AlmaLinux + GNOME), macOS, and Windows.
+
+Use the app buttons to:
+- load an existing database
+- add files
+- edit sample metadata
+- choose output folder
+- export standardized data
 
 ### Launch App
 
-streamlit run streamlit_lab_browser_08042026.py
+streamlit run streamlit_lab_browser.py
 
 ---
 
@@ -103,7 +114,7 @@ LabDatabases/
 
 If Streamlit command fails:
 
-python -m streamlit run streamlit_lab_browser_08042026.py
+python -m streamlit run streamlit_lab_browser.py
 
 If data does not load:
 - Ensure manifests folder exists
@@ -122,3 +133,22 @@ If data does not load:
 ## Author
 Sean Raglow
 Internal lab tool
+
+
+## SQLite Database (Incremental + Idempotent)
+
+The exporter now builds/updates `lab_data.sqlite` in each database root.
+
+- Incremental updates: new experiments are appended without rebuilding existing tables.
+- Idempotent re-runs: existing experiment IDs are upserted and point rows are replaced only for that experiment.
+- Ingestion tracking: `ingestion_log` stores `experiment_id`, `source_hash`, `parser_version`, and ingest timestamp.
+- Plot data storage: measurement points are stored in per-type tables (`points_<measurement_type>`).
+
+Core SQLite tables:
+- `samples`
+- `experiments`
+- `metrics_long`
+- `ingestion_log`
+- `points_<measurement_type>` (created on demand)
+
+The Streamlit browser prefers SQLite for manifests and plotted points, and falls back to CSV files if needed.

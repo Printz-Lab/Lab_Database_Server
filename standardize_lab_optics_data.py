@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+import hashlib
+import sqlite3
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -51,6 +51,141 @@ def slugify(text: str) -> str:
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
+
+
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def init_sqlite_database(db_path: Path) -> None:
+    con = sqlite3.connect(str(db_path))
+    cur = con.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS samples (
+        sample_id TEXT PRIMARY KEY,
+        formulation TEXT,
+        batch TEXT
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS experiments (
+        experiment_id TEXT PRIMARY KEY,
+        sample_id TEXT NOT NULL,
+        measurement_type TEXT NOT NULL,
+        experiment_subtype TEXT,
+        source_label TEXT,
+        source_file TEXT,
+        raw_data_path TEXT,
+        processed_data_path TEXT,
+        fit_parameters_path TEXT,
+        parser TEXT,
+        parser_version TEXT,
+        source_hash TEXT,
+        ingested_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ingestion_log (
+        experiment_id TEXT PRIMARY KEY,
+        source_hash TEXT NOT NULL,
+        parser_version TEXT NOT NULL,
+        ingested_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS metrics_long (
+        experiment_id TEXT NOT NULL,
+        metric_name TEXT NOT NULL,
+        metric_value REAL,
+        PRIMARY KEY (experiment_id, metric_name)
+    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_experiments_sample ON experiments(sample_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_experiments_measurement ON experiments(measurement_type)")
+    con.commit()
+    con.close()
+
+
+def table_for_measurement(measurement_type: str) -> str:
+    m = re.sub(r"[^a-z0-9]+", "_", str(measurement_type).lower()).strip("_")
+    return f"points_{m or 'unknown'}"
+
+
+def upsert_experiment_to_sqlite(db_path: Path, experiment_row: dict, sample_row: dict, source_hash: str, parser_version: str,
+                                processed_df: Optional[pd.DataFrame], raw_df: Optional[pd.DataFrame], params_df: Optional[pd.DataFrame], metadata: dict) -> None:
+    con = sqlite3.connect(str(db_path))
+    cur = con.cursor()
+
+    cur.execute(
+        "INSERT INTO samples(sample_id, formulation, batch) VALUES(?,?,?) ON CONFLICT(sample_id) DO UPDATE SET formulation=excluded.formulation, batch=excluded.batch",
+        (sample_row.get("sample_id",""), sample_row.get("formulation",""), sample_row.get("batch",""))
+    )
+
+    cur.execute(
+        """INSERT INTO experiments(
+            experiment_id, sample_id, measurement_type, experiment_subtype, source_label, source_file,
+            raw_data_path, processed_data_path, fit_parameters_path, parser, parser_version, source_hash, ingested_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+        ON CONFLICT(experiment_id) DO UPDATE SET
+            sample_id=excluded.sample_id, measurement_type=excluded.measurement_type, experiment_subtype=excluded.experiment_subtype,
+            source_label=excluded.source_label, source_file=excluded.source_file, raw_data_path=excluded.raw_data_path,
+            processed_data_path=excluded.processed_data_path, fit_parameters_path=excluded.fit_parameters_path, parser=excluded.parser,
+            parser_version=excluded.parser_version, source_hash=excluded.source_hash, ingested_at=CURRENT_TIMESTAMP
+        """,
+        (experiment_row.get("experiment_id",""), experiment_row.get("sample_id",""), experiment_row.get("measurement_type",""),
+         experiment_row.get("experiment_subtype",""), experiment_row.get("source_label",""), experiment_row.get("source_file",""),
+         experiment_row.get("raw_data_path",""), experiment_row.get("processed_data_path",""), experiment_row.get("fit_parameters_path",""),
+         experiment_row.get("parser",""), parser_version, source_hash)
+    )
+
+    measurement_type = experiment_row.get("measurement_type", "")
+    points_table = table_for_measurement(measurement_type)
+    cols = []
+    df = processed_df if processed_df is not None and not processed_df.empty else raw_df
+    if df is not None and not df.empty:
+        cur.execute(f'DROP TABLE IF EXISTS "{points_table}"') if False else None
+        cols = [c for c in df.columns]
+        schema_cols = ", ".join([f'"{c}" REAL' for c in cols])
+        cur.execute(f'CREATE TABLE IF NOT EXISTS "{points_table}" (experiment_id TEXT NOT NULL, row_idx INTEGER NOT NULL, {schema_cols}, PRIMARY KEY(experiment_id,row_idx))')
+        cur.execute(f'DELETE FROM "{points_table}" WHERE experiment_id=?', (experiment_row.get("experiment_id",""),))
+        ins_cols = ', '.join([f'"{c}"' for c in cols])
+        placeholders = ', '.join(['?'] * (2 + len(cols)))
+        rows=[]
+        numeric_df = df.copy()
+        for c in cols:
+            numeric_df[c] = pd.to_numeric(numeric_df[c], errors='coerce')
+        for i, r in numeric_df.reset_index(drop=True).iterrows():
+            rows.append((experiment_row.get("experiment_id",""), int(i), *[None if pd.isna(v) else float(v) for v in r.tolist()]))
+        cur.executemany(f'INSERT OR REPLACE INTO "{points_table}" (experiment_id, row_idx, {ins_cols}) VALUES ({placeholders})', rows)
+
+    metrics = {}
+    if params_df is not None and not params_df.empty:
+        first = params_df.iloc[0]
+        for c,v in first.items():
+            try:
+                metrics[str(c)] = float(v)
+            except Exception:
+                pass
+    if isinstance(metadata, dict):
+        md = metadata.get('metadata', metadata) if isinstance(metadata.get('metadata', metadata), dict) else metadata
+        for c,v in md.items():
+            try:
+                metrics[f'metadata.{c}'] = float(v)
+            except Exception:
+                pass
+    cur.execute('DELETE FROM metrics_long WHERE experiment_id=?', (experiment_row.get("experiment_id",""),))
+    if metrics:
+        cur.executemany('INSERT OR REPLACE INTO metrics_long(experiment_id, metric_name, metric_value) VALUES (?,?,?)',
+                        [(experiment_row.get("experiment_id",""), k, v) for k,v in metrics.items()])
+
+    cur.execute('INSERT OR REPLACE INTO ingestion_log(experiment_id, source_hash, parser_version, ingested_at) VALUES (?,?,?,CURRENT_TIMESTAMP)',
+                (experiment_row.get("experiment_id",""), source_hash, parser_version))
+    con.commit(); con.close()
 
 def load_existing_manifests(out_root: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     manifests_dir = out_root / "manifests"
@@ -443,239 +578,105 @@ def detect_and_parse(path: Path) -> List[dict]:
 
 
 # -----------------------------
-# GUI App
+# PySide6 GUI App (cross-platform)
 # -----------------------------
+from PySide6 import QtCore, QtWidgets
 
-class DataStandardizerApp:
-    def __init__(self, master: tk.Tk):
-        self.master = master
-        self.master.title(APP_TITLE)
-        self.master.geometry("1380x800")
+
+class DataStandardizerApp(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_TITLE)
+        self.resize(1400, 850)
 
         self.records: List[dict] = []
-        self.file_paths: List[Path] = []
-        self.tree_items: Dict[str, int] = {}
-        self.loaded_database_root: Optional[Path] = None
+        self.output_dir = str(Path.cwd() / "standardized_lab_data")
 
-        self.sample_id_var = tk.StringVar()
-        self.formulation_var = tk.StringVar()
-        self.batch_var = tk.StringVar()
-        self.notes_var = tk.StringVar()
-        self.output_dir_var = tk.StringVar(value=str(Path.cwd() / "standardized_lab_data"))
-        self.status_var = tk.StringVar(value="Ready.")
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        root = QtWidgets.QVBoxLayout(central)
 
-        self._build_ui()
+        top = QtWidgets.QHBoxLayout()
+        self.btn_load = QtWidgets.QPushButton("Load existing database")
+        self.btn_add = QtWidgets.QPushButton("Add files")
+        self.btn_remove = QtWidgets.QPushButton("Remove selected")
+        self.btn_autofill = QtWidgets.QPushButton("Autofill sample IDs")
+        self.btn_choose_out = QtWidgets.QPushButton("Choose output folder")
+        self.btn_export = QtWidgets.QPushButton("Export standardized data")
+        for b in [self.btn_load, self.btn_add, self.btn_remove, self.btn_autofill, self.btn_choose_out, self.btn_export]:
+            top.addWidget(b)
+        root.addLayout(top)
 
-    def _build_ui(self):
-        top = ttk.Frame(self.master, padding=10)
-        top.pack(fill="x")
+        out_row = QtWidgets.QHBoxLayout()
+        out_row.addWidget(QtWidgets.QLabel("Output folder:"))
+        self.out_edit = QtWidgets.QLineEdit(self.output_dir)
+        out_row.addWidget(self.out_edit)
+        root.addLayout(out_row)
 
-        ttk.Button(top, text="Load existing database", command=self.load_existing_database).pack(side="left", padx=4)
-        ttk.Button(top, text="Add files", command=self.add_files).pack(side="left", padx=4)
-        ttk.Button(top, text="Remove selected", command=self.remove_selected).pack(side="left", padx=4)
-        ttk.Button(top, text="Autofill sample IDs", command=self.autofill_sample_ids).pack(side="left", padx=4)
-        ttk.Button(top, text="Choose output folder", command=self.choose_output_dir).pack(side="left", padx=4)
-        ttk.Button(top, text="Export standardized data", command=self.export_all).pack(side="left", padx=12)
+        self.status = QtWidgets.QLabel("Ready.")
+        root.addWidget(self.status)
 
-        out_frame = ttk.Frame(self.master, padding=(10, 0, 10, 8))
-        out_frame.pack(fill="x")
-        ttk.Label(out_frame, text="Output folder:").pack(side="left")
-        ttk.Entry(out_frame, textvariable=self.output_dir_var, width=100).pack(side="left", fill="x", expand=True, padx=6)
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        root.addWidget(split, 1)
 
-        status_frame = ttk.Frame(self.master, padding=(10, 0, 10, 6))
-        status_frame.pack(fill="x")
-        ttk.Label(status_frame, textvariable=self.status_var).pack(anchor="w")
+        left = QtWidgets.QWidget(); left_l = QtWidgets.QVBoxLayout(left)
+        self.table = QtWidgets.QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(["Origin", "Experiment ID", "Detected sample", "Standard sample ID", "Measurement", "Subtype", "Source file", "Source label"])
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        left_l.addWidget(self.table)
+        split.addWidget(left)
 
-        mid = ttk.Panedwindow(self.master, orient="horizontal")
-        mid.pack(fill="both", expand=True, padx=10, pady=8)
+        right = QtWidgets.QWidget(); form = QtWidgets.QFormLayout(right)
+        self.sample_edit = QtWidgets.QLineEdit()
+        self.formulation_edit = QtWidgets.QLineEdit()
+        self.batch_edit = QtWidgets.QLineEdit()
+        self.notes_edit = QtWidgets.QLineEdit()
+        form.addRow("Standard sample ID", self.sample_edit)
+        form.addRow("Formulation", self.formulation_edit)
+        form.addRow("Batch / replicate", self.batch_edit)
+        form.addRow("Notes", self.notes_edit)
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_apply = QtWidgets.QPushButton("Apply to selected")
+        self.btn_clear = QtWidgets.QPushButton("Clear fields")
+        btn_row.addWidget(self.btn_apply); btn_row.addWidget(self.btn_clear)
+        form.addRow(btn_row)
+        info = QtWidgets.QTextEdit(); info.setReadOnly(True)
+        info.setPlainText("""Load existing database:
+- reads manifests/experiments.csv and samples.csv
+- loads existing experiment metadata into the editor
+- lets you rename sample IDs / formulation / batch / notes
 
-        left = ttk.Frame(mid)
-        right = ttk.Frame(mid)
-        mid.add(left, weight=4)
-        mid.add(right, weight=2)
+Export standardized data:
+- updates loaded experiments in place when experiment_id already exists
+- appends new experiments for newly added source files
+- keeps existing raw/processed/fitted CSVs unless new parsed data is present
+- merges samples.csv rather than replacing the whole database
+""")
+        form.addRow(info)
+        split.addWidget(right)
+        split.setSizes([900, 500])
 
-        self.tree = ttk.Treeview(
-            left,
-            columns=("origin", "experiment_id", "sample_guess", "sample_id", "measurement_type", "subtype", "source_file", "source_label"),
-            show="headings",
-            selectmode="extended",
-        )
-        for col, text, width in [
-            ("origin", "Origin", 90),
-            ("experiment_id", "Experiment ID", 190),
-            ("sample_guess", "Detected sample", 120),
-            ("sample_id", "Standard sample ID", 170),
-            ("measurement_type", "Measurement", 160),
-            ("subtype", "Subtype", 130),
-            ("source_file", "Source file", 220),
-            ("source_label", "Source label", 180),
-        ]:
-            self.tree.heading(col, text=text)
-            self.tree.column(col, width=width, stretch=True)
-        self.tree.pack(fill="both", expand=True)
-        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.btn_add.clicked.connect(self.add_files)
+        self.btn_remove.clicked.connect(self.remove_selected)
+        self.btn_autofill.clicked.connect(self.autofill_sample_ids)
+        self.btn_choose_out.clicked.connect(self.choose_output_dir)
+        self.btn_export.clicked.connect(self.export_all)
+        self.btn_load.clicked.connect(self.load_existing_database)
+        self.btn_apply.clicked.connect(self.apply_to_selected)
+        self.btn_clear.clicked.connect(self.clear_form)
+        self.table.itemSelectionChanged.connect(self.on_select)
 
-        form = ttk.LabelFrame(right, text="Edit selected record", padding=10)
-        form.pack(fill="x", padx=4, pady=4)
+    def set_status(self, text: str):
+        self.status.setText(text)
 
-        self._labeled_entry(form, "Standard sample ID", self.sample_id_var, 0)
-        self._labeled_entry(form, "Formulation", self.formulation_var, 1)
-        self._labeled_entry(form, "Batch / replicate", self.batch_var, 2)
-        self._labeled_entry(form, "Notes", self.notes_var, 3)
-
-        btns = ttk.Frame(form)
-        btns.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Button(btns, text="Apply to selected", command=self.apply_to_selected).pack(side="left", padx=4)
-        ttk.Button(btns, text="Clear fields", command=self.clear_form).pack(side="left", padx=4)
-
-        info = ttk.LabelFrame(right, text="How edit mode works", padding=10)
-        info.pack(fill="both", expand=True, padx=4, pady=4)
-        msg = (
-            "Load existing database:\n"
-            "- reads manifests/experiments.csv and samples.csv\n"
-            "- loads existing experiment metadata into the editor\n"
-            "- lets you rename sample IDs / formulation / batch / notes\n\n"
-            "Export standardized data:\n"
-            "- updates loaded experiments in place when experiment_id already exists\n"
-            "- appends new experiments for newly added source files\n"
-            "- keeps existing raw/processed/fitted CSVs unless new parsed data is present\n"
-            "- merges samples.csv rather than replacing the whole database\n"
-        )
-        ttk.Label(info, text=msg, justify="left").pack(anchor="w")
-
-    def _labeled_entry(self, parent, label, var, row):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(parent, textvariable=var, width=40).grid(row=row, column=1, sticky="ew", pady=4)
-        parent.grid_columnconfigure(1, weight=1)
-
-    def _set_status(self, text: str):
-        self.status_var.set(text)
-
-    def add_files(self):
-        paths = filedialog.askopenfilenames(
-            title="Choose characterization files",
-            filetypes=[
-                ("Supported files", "*.xlsx *.xls *.csv"),
-                ("Excel files", "*.xlsx *.xls"),
-                ("CSV files", "*.csv"),
-                ("All files", "*.*"),
-            ],
-        )
-        if not paths:
-            return
-
-        added = 0
-        skipped = []
-        for p in paths:
-            path = Path(p)
-            try:
-                records = detect_and_parse(path)
-                if not records:
-                    skipped.append(path.name)
-                    continue
-                for rec in records:
-                    rec["sample_id"] = rec.get("sample_guess", "")
-                    rec["formulation"] = ""
-                    rec["batch"] = ""
-                    rec["user_notes"] = ""
-                    rec["existing_experiment_id"] = ""
-                    rec["loaded_from_database"] = False
-                    rec["db_existing_paths"] = {}
-                    self.records.append(rec)
-                    self._insert_record(len(self.records) - 1)
-                    added += 1
-                self.file_paths.append(path)
-            except Exception as exc:
-                skipped.append(f"{path.name} ({exc})")
-
-        msg = f"Added {added} record(s)."
-        if skipped:
-            msg += "\n\nSkipped:\n- " + "\n- ".join(skipped)
-        self._set_status(f"Session now has {len([r for r in self.records if not r.get('_removed')])} active record(s).")
-        messagebox.showinfo(APP_TITLE, msg)
-
-    def load_existing_database(self):
-        start_dir = self.output_dir_var.get().strip() or str(Path.cwd())
-        chosen = filedialog.askdirectory(title="Choose existing standardized data folder", initialdir=start_dir)
-        if not chosen:
-            return
-
-        out_root = Path(chosen).expanduser().resolve()
-        existing_experiments, existing_samples = load_existing_manifests(out_root)
-        if existing_experiments.empty:
-            messagebox.showwarning(APP_TITLE, f"Could not find an existing experiments manifest in:\n{out_root}")
-            return
-
-        sample_lookup = {}
-        if existing_samples is not None and not existing_samples.empty and "sample_id" in existing_samples.columns:
-            for _, row in existing_samples.iterrows():
-                sample_lookup[str(row.get("sample_id", "")).strip()] = row.to_dict()
-
-        added = 0
-        skipped = 0
-        existing_ids_in_session = {
-            str(r.get("existing_experiment_id") or r.get("experiment_id") or "").strip()
-            for r in self.records if not r.get("_removed")
-        }
-
-        for _, row in existing_experiments.fillna("").iterrows():
-            experiment_id = str(row.get("experiment_id", "")).strip()
-            if not experiment_id or experiment_id in existing_ids_in_session:
-                skipped += 1
-                continue
-
-            exp_dir = out_root / "experiments" / experiment_id
-            metadata_path = exp_dir / "metadata.json"
-            metadata_json = json.load(open(str(metadata_path), "r", encoding="utf-8")) if metadata_path.exists() else {}
-            nested_metadata = metadata_json.get("metadata", {}) if isinstance(metadata_json.get("metadata", {}), dict) else {}
-
-            sample_id = str(row.get("sample_id", metadata_json.get("sample_id", ""))).strip()
-            sample_meta = sample_lookup.get(sample_id, {})
-            source_file_name = str(row.get("source_file", "")).strip()
-            source_file_value = str(out_root / source_file_name) if source_file_name else str(metadata_json.get("source_file", ""))
-
-            rec = {
-                "source_file": source_file_value,
-                "parser": metadata_json.get("parser", "loaded_manifest"),
-                "measurement_type": str(row.get("measurement_type", metadata_json.get("measurement_type", ""))).strip(),
-                "experiment_subtype": str(row.get("experiment_subtype", metadata_json.get("experiment_subtype", ""))).strip(),
-                "source_label": str(row.get("source_label", metadata_json.get("source_label", ""))).strip(),
-                "sample_guess": sample_id or clean_sample_name(row.get("source_label", "")),
-                "sample_id": sample_id,
-                "formulation": str(row.get("formulation", sample_meta.get("formulation", metadata_json.get("formulation", "")))).strip(),
-                "batch": str(row.get("batch", sample_meta.get("batch", metadata_json.get("batch", "")))).strip(),
-                "user_notes": str(row.get("notes", metadata_json.get("user_notes", ""))).strip(),
-                "raw_df": None,
-                "processed_df": None,
-                "params_df": None,
-                "metadata": nested_metadata,
-                "experiment_id": experiment_id,
-                "existing_experiment_id": experiment_id,
-                "loaded_from_database": True,
-                "db_existing_paths": {
-                    "raw_data_path": str(row.get("raw_data_path", "")).strip(),
-                    "processed_data_path": str(row.get("processed_data_path", "")).strip(),
-                    "fit_parameters_path": str(row.get("fit_parameters_path", "")).strip(),
-                },
-            }
-            self.records.append(rec)
-            self._insert_record(len(self.records) - 1)
-            existing_ids_in_session.add(experiment_id)
-            added += 1
-
-        self.loaded_database_root = out_root
-        self.output_dir_var.set(str(out_root))
-        self._set_status(f"Loaded {added} existing experiment record(s) from {out_root}.")
-        messagebox.showinfo(APP_TITLE, f"Loaded {added} experiment record(s) from:\n{out_root}\n\nSkipped duplicates already present in the session: {skipped}")
-
-    def _insert_record(self, idx: int):
-        rec = self.records[idx]
-        origin = "database" if rec.get("loaded_from_database") else "new"
-        item = self.tree.insert(
-            "",
-            "end",
-            values=(
-                origin,
+    def refresh_table(self):
+        active = [r for r in self.records if not r.get("_removed")]
+        self.table.setRowCount(len(active))
+        for r_idx, rec in enumerate(active):
+            vals = [
+                "database" if rec.get("loaded_from_database") else "new",
                 rec.get("existing_experiment_id") or rec.get("experiment_id", ""),
                 rec.get("sample_guess", ""),
                 rec.get("sample_id", ""),
@@ -683,258 +684,120 @@ class DataStandardizerApp:
                 rec.get("experiment_subtype", ""),
                 Path(str(rec.get("source_file", ""))).name,
                 rec.get("source_label", ""),
-            ),
-        )
-        self.tree_items[item] = idx
+            ]
+            for c, v in enumerate(vals):
+                self.table.setItem(r_idx, c, QtWidgets.QTableWidgetItem(str(v)))
+
+    def selected_record_indexes(self) -> List[int]:
+        rows = sorted(set(i.row() for i in self.table.selectionModel().selectedRows()))
+        active_idxs = [i for i, r in enumerate(self.records) if not r.get("_removed")]
+        return [active_idxs[r] for r in rows if r < len(active_idxs)]
+
+    def add_files(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Choose characterization files", "", "Supported files (*.xlsx *.xls *.csv);;All files (*.*)")
+        if not paths:
+            return
+        added = 0; skipped = []
+        for pth in paths:
+            path = Path(pth)
+            try:
+                parsed = detect_and_parse(path)
+                if not parsed:
+                    skipped.append(path.name); continue
+                for rec in parsed:
+                    rec["sample_id"] = rec.get("sample_guess", "")
+                    rec["formulation"] = ""; rec["batch"] = ""; rec["user_notes"] = ""
+                    rec["existing_experiment_id"] = ""; rec["loaded_from_database"] = False; rec["db_existing_paths"] = {}
+                    self.records.append(rec); added += 1
+            except Exception as exc:
+                skipped.append(f"{path.name} ({exc})")
+        self.refresh_table()
+        self.set_status(f"Session now has {len([r for r in self.records if not r.get('_removed')])} active record(s).")
+        msg = f"Added {added} record(s)." + ("\n\nSkipped:\n- " + "\n- ".join(skipped) if skipped else "")
+        QtWidgets.QMessageBox.information(self, APP_TITLE, msg)
 
     def remove_selected(self):
-        selected = list(self.tree.selection())
-        if not selected:
-            return
-        for item in selected:
-            idx = self.tree_items.pop(item)
-            self.records[idx]["_removed"] = True
-            self.tree.delete(item)
-        self._set_status(f"Marked {len(selected)} row(s) as removed for this session. They will not be exported.")
-        messagebox.showinfo(APP_TITLE, f"Removed {len(selected)} selected row(s) from the current session.")
+        idxs = self.selected_record_indexes()
+        for idx in idxs: self.records[idx]["_removed"] = True
+        self.refresh_table(); self.set_status(f"Marked {len(idxs)} row(s) as removed for this session.")
 
     def autofill_sample_ids(self):
         for rec in self.records:
-            if rec.get("_removed"):
-                continue
-            rec["sample_id"] = clean_sample_name(rec.get("sample_guess", ""))
-        self.refresh_tree()
-        self._set_status("Sample IDs autofilled from detected names.")
-        messagebox.showinfo(APP_TITLE, "Sample IDs were autofilled from detected names. You can still edit them.")
+            if not rec.get("_removed"): rec["sample_id"] = clean_sample_name(rec.get("sample_guess", ""))
+        self.refresh_table(); self.set_status("Sample IDs autofilled from detected names.")
 
-    def refresh_tree(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        self.tree_items.clear()
-        for idx, rec in enumerate(self.records):
-            if rec.get("_removed"):
-                continue
-            self._insert_record(idx)
-
-    def on_select(self, _event=None):
-        selected = self.tree.selection()
-        if not selected:
-            return
-        idx = self.tree_items[selected[0]]
-        rec = self.records[idx]
-        self.sample_id_var.set(rec.get("sample_id", ""))
-        self.formulation_var.set(rec.get("formulation", ""))
-        self.batch_var.set(rec.get("batch", ""))
-        self.notes_var.set(rec.get("user_notes", ""))
+    def on_select(self):
+        idxs = self.selected_record_indexes()
+        if not idxs: return
+        rec = self.records[idxs[0]]
+        self.sample_edit.setText(str(rec.get("sample_id", "")))
+        self.formulation_edit.setText(str(rec.get("formulation", "")))
+        self.batch_edit.setText(str(rec.get("batch", "")))
+        self.notes_edit.setText(str(rec.get("user_notes", "")))
 
     def apply_to_selected(self):
-        selected = self.tree.selection()
-        if not selected:
-            messagebox.showwarning(APP_TITLE, "Select at least one row first.")
+        idxs = self.selected_record_indexes()
+        if not idxs:
+            QtWidgets.QMessageBox.warning(self, APP_TITLE, "Select at least one row first.")
             return
-
-        for item in selected:
-            idx = self.tree_items[item]
-            self.records[idx]["sample_id"] = self.sample_id_var.get().strip() or self.records[idx].get("sample_id", "")
-            self.records[idx]["formulation"] = self.formulation_var.get().strip()
-            self.records[idx]["batch"] = self.batch_var.get().strip()
-            self.records[idx]["user_notes"] = self.notes_var.get().strip()
-        self.refresh_tree()
-        self._set_status(f"Updated {len(selected)} selected record(s).")
+        for idx in idxs:
+            rec = self.records[idx]
+            rec["sample_id"] = self.sample_edit.text().strip() or rec.get("sample_id", "")
+            rec["formulation"] = self.formulation_edit.text().strip()
+            rec["batch"] = self.batch_edit.text().strip()
+            rec["user_notes"] = self.notes_edit.text().strip()
+        self.refresh_table(); self.set_status(f"Updated {len(idxs)} selected record(s).")
 
     def clear_form(self):
-        self.sample_id_var.set("")
-        self.formulation_var.set("")
-        self.batch_var.set("")
-        self.notes_var.set("")
+        self.sample_edit.clear(); self.formulation_edit.clear(); self.batch_edit.clear(); self.notes_edit.clear()
 
     def choose_output_dir(self):
-        out = filedialog.askdirectory(title="Choose export folder")
+        out = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose export folder", self.out_edit.text().strip() or str(Path.cwd()))
         if out:
-            self.output_dir_var.set(out)
-            self._set_status(f"Output folder set to {out}")
+            self.out_edit.setText(out); self.output_dir = out; self.set_status(f"Output folder set to {out}")
+
+    def load_existing_database(self):
+        chosen = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose existing standardized data folder", self.out_edit.text().strip() or str(Path.cwd()))
+        if not chosen: return
+        out_root = Path(chosen).expanduser().resolve()
+        existing_experiments, existing_samples = load_existing_manifests(out_root)
+        if existing_experiments.empty:
+            QtWidgets.QMessageBox.warning(self, APP_TITLE, f"Could not find existing experiments manifest in:\n{out_root}")
+            return
+        sample_lookup = {}
+        if existing_samples is not None and not existing_samples.empty and "sample_id" in existing_samples.columns:
+            for _, row in existing_samples.iterrows():
+                sample_lookup[str(row.get("sample_id", "")).strip()] = row.to_dict()
+        existing_ids = {str(r.get("existing_experiment_id") or r.get("experiment_id") or "").strip() for r in self.records if not r.get("_removed")}
+        added = 0; skipped = 0
+        for _, row in existing_experiments.fillna("").iterrows():
+            exp_id = str(row.get("experiment_id", "")).strip()
+            if not exp_id or exp_id in existing_ids:
+                skipped += 1; continue
+            self.records.append(build_record_from_existing_row(out_root, row, sample_lookup)); added += 1; existing_ids.add(exp_id)
+        self.out_edit.setText(str(out_root)); self.refresh_table()
+        self.set_status(f"Loaded {added} existing experiment record(s) from {out_root}.")
+        QtWidgets.QMessageBox.information(self, APP_TITLE, f"Loaded {added} experiment record(s).\nSkipped duplicates: {skipped}")
 
     def export_all(self):
-        active = [r for r in self.records if not r.get("_removed")]
-        if not active:
-            messagebox.showwarning(APP_TITLE, "No records to export.")
-            return
+        records = [r for r in self.records if not r.get("_removed")]
+        if not records:
+            QtWidgets.QMessageBox.warning(self, APP_TITLE, "No records to export."); return
+        if any(not str(r.get("sample_id", "")).strip() for r in records):
+            QtWidgets.QMessageBox.warning(self, APP_TITLE, "Every record needs a standard sample ID before export."); return
+        out_root = Path(self.out_edit.text().strip() or self.output_dir).expanduser().resolve()
+        added, updated, skipped = export_records(records, out_root)
+        self.refresh_table()
+        self.set_status(f"Export complete to {out_root}. Added {added}, updated {updated}, skipped {skipped} duplicate new record(s).")
+        QtWidgets.QMessageBox.information(self, APP_TITLE, f"Export complete.\n\nSaved to:\n{out_root}\n\nAdded: {added}\nUpdated: {updated}\nSkipped duplicates: {skipped}")
 
-        missing = [r for r in active if not str(r.get("sample_id", "")).strip()]
-        if missing:
-            messagebox.showwarning(APP_TITLE, "Every record needs a standard sample ID before export.")
-            return
 
-        out_root = Path(self.output_dir_var.get()).expanduser().resolve()
-        manifests_dir = out_root / "manifests"
-        experiments_dir = out_root / "experiments"
-        ensure_dir(manifests_dir)
-        ensure_dir(experiments_dir)
-
-        existing_experiments, existing_samples = load_existing_manifests(out_root)
-        existing_experiments = existing_experiments.fillna("") if existing_experiments is not None else pd.DataFrame()
-        existing_samples = existing_samples.fillna("") if existing_samples is not None else pd.DataFrame()
-
-        existing_rows_by_id: Dict[str, dict] = {}
-        if not existing_experiments.empty and "experiment_id" in existing_experiments.columns:
-            for _, row in existing_experiments.iterrows():
-                existing_rows_by_id[str(row.get("experiment_id", "")).strip()] = row.to_dict()
-
-        counters = build_existing_counter_map(existing_experiments)
-        existing_duplicate_keys = set()
-        if not existing_experiments.empty:
-            for _, row in existing_experiments.iterrows():
-                existing_duplicate_keys.add(
-                    make_duplicate_key(
-                        row.get("sample_id", ""),
-                        row.get("measurement_type", ""),
-                        row.get("experiment_subtype", ""),
-                        row.get("source_file", ""),
-                        row.get("source_label", ""),
-                    )
-                )
-
-        final_experiment_rows: Dict[str, dict] = {k: v.copy() for k, v in existing_rows_by_id.items()}
-        sample_manifest_rows: List[dict] = []
-        added_count = 0
-        updated_count = 0
-        skipped_duplicates = 0
-
-        for rec in active:
-            sample_id = str(rec.get("sample_id", "")).strip()
-            measurement_type = str(rec.get("measurement_type", "")).strip()
-            subtype = str(rec.get("experiment_subtype", "") or "default").strip()
-            source_file_name = Path(str(rec.get("source_file", ""))).name
-            source_label = str(rec.get("source_label", "")).strip()
-            existing_experiment_id = str(rec.get("existing_experiment_id") or rec.get("experiment_id") or "").strip()
-
-            if existing_experiment_id:
-                experiment_id = existing_experiment_id
-                existing_row = final_experiment_rows.get(experiment_id, existing_rows_by_id.get(experiment_id, {}))
-            else:
-                dup_key = make_duplicate_key(sample_id, measurement_type, subtype, source_file_name, source_label)
-                if dup_key in existing_duplicate_keys:
-                    skipped_duplicates += 1
-                    continue
-                key = f"{sample_id}__{measurement_type}"
-                counters[key] = counters.get(key, 0) + 1
-                seq = counters[key]
-                experiment_id = f"{slugify(sample_id)}__{slugify(measurement_type)}__{seq:03d}"
-                existing_row = {}
-                existing_duplicate_keys.add(dup_key)
-
-            exp_dir = experiments_dir / experiment_id
-            ensure_dir(exp_dir)
-
-            raw_rel = str(existing_row.get("raw_data_path", "") or rec.get("db_existing_paths", {}).get("raw_data_path", "")).strip() or None
-            processed_rel = str(existing_row.get("processed_data_path", "") or rec.get("db_existing_paths", {}).get("processed_data_path", "")).strip() or None
-            params_rel = str(existing_row.get("fit_parameters_path", "") or rec.get("db_existing_paths", {}).get("fit_parameters_path", "")).strip() or None
-
-            if rec.get("raw_df") is not None:
-                raw_rel = f"experiments/{experiment_id}/raw_data.csv"
-                rec["raw_df"].to_csv(out_root / raw_rel, index=False)
-            if rec.get("processed_df") is not None:
-                processed_rel = f"experiments/{experiment_id}/processed_data.csv"
-                rec["processed_df"].to_csv(out_root / processed_rel, index=False)
-            if rec.get("params_df") is not None:
-                params_rel = f"experiments/{experiment_id}/fit_parameters.csv"
-                rec["params_df"].to_csv(out_root / params_rel, index=False)
-
-            metadata_path = exp_dir / "metadata.json"
-            old_meta = json.load(open(str(metadata_path), "r", encoding="utf-8")) if metadata_path.exists() else {}
-            nested_metadata = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else old_meta.get("metadata", {})
-            metadata = {
-                "experiment_id": experiment_id,
-                "sample_id": sample_id,
-                "measurement_type": measurement_type,
-                "experiment_subtype": subtype,
-                "source_label": source_label,
-                "source_file": rec.get("source_file"),
-                "parser": rec.get("parser", old_meta.get("parser")),
-                "formulation": rec.get("formulation", old_meta.get("formulation", "")),
-                "batch": rec.get("batch", old_meta.get("batch", "")),
-                "user_notes": rec.get("user_notes", old_meta.get("user_notes", "")),
-                "metadata": nested_metadata,
-            }
-            with open(metadata_path, "w", encoding="utf-8") as f:
-                json.dump(metadata, f, indent=2)
-
-            final_experiment_rows[experiment_id] = {
-                "experiment_id": experiment_id,
-                "sample_id": sample_id,
-                "measurement_type": measurement_type,
-                "experiment_subtype": subtype,
-                "source_label": source_label,
-                "source_file": source_file_name,
-                "raw_data_path": raw_rel or "",
-                "processed_data_path": processed_rel or "",
-                "fit_parameters_path": params_rel or "",
-                "formulation": rec.get("formulation", ""),
-                "batch": rec.get("batch", ""),
-                "notes": rec.get("user_notes", ""),
-            }
-
-            sample_manifest_rows.append({
-                "sample_id": sample_id,
-                "formulation": rec.get("formulation", ""),
-                "batch": rec.get("batch", ""),
-            })
-
-            if existing_experiment_id:
-                updated_count += 1
-            else:
-                added_count += 1
-                rec["existing_experiment_id"] = experiment_id
-                rec["experiment_id"] = experiment_id
-
-        final_experiments_df = pd.DataFrame(list(final_experiment_rows.values()))
-        if not final_experiments_df.empty:
-            for col in ["experiment_id", "sample_id", "measurement_type", "experiment_subtype", "source_label", "source_file", "raw_data_path", "processed_data_path", "fit_parameters_path", "formulation", "batch", "notes"]:
-                if col not in final_experiments_df.columns:
-                    final_experiments_df[col] = ""
-            final_experiments_df = final_experiments_df.fillna("")
-            final_experiments_df = final_experiments_df.sort_values(["sample_id", "measurement_type", "experiment_id"], kind="stable")
-        final_experiments_df.to_csv(manifests_dir / "experiments.csv", index=False)
-
-        merged_samples_df = merge_sample_manifests(existing_samples, sample_manifest_rows)
-        merged_samples_df.to_csv(manifests_dir / "samples.csv", index=False)
-
-        readme = out_root / "README_standardized_format.txt"
-        readme.write_text(
-            "Standardized lab characterization export\n\n"
-            "Top-level folders:\n"
-            "- manifests/: tables that index samples and experiments\n"
-            "- experiments/: one folder per experiment record\n\n"
-            "Inside each experiment folder you may find:\n"
-            "- raw_data.csv\n"
-            "- processed_data.csv\n"
-            "- fit_parameters.csv\n"
-            "- metadata.json\n",
-            encoding="utf-8",
-        )
-
-        self.refresh_tree()
-        self._set_status(
-            f"Export complete to {out_root}. Added {added_count}, updated {updated_count}, skipped {skipped_duplicates} duplicate new record(s)."
-        )
-        messagebox.showinfo(
-            APP_TITLE,
-            f"Export complete.\n\nSaved to:\n{out_root}\n\nAdded new experiments: {added_count}\nUpdated existing experiments: {updated_count}\nSkipped duplicate new records: {skipped_duplicates}",
-        )
+def main() -> None:
+    app = QtWidgets.QApplication([])
+    win = DataStandardizerApp()
+    win.show()
+    app.exec()
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    try:
-        root.call("tk", "scaling", 1.25)
-    except Exception:
-        pass
-    style = ttk.Style(root)
-    for theme in ("vista", "clam", "default"):
-        try:
-            style.theme_use(theme)
-            break
-        except Exception:
-            continue
-    app = DataStandardizerApp(root)
-    root.mainloop()
+    main()

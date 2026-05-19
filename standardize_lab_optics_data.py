@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
+import sqlite3
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
@@ -51,6 +53,141 @@ def slugify(text: str) -> str:
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
+
+
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def init_sqlite_database(db_path: Path) -> None:
+    con = sqlite3.connect(str(db_path))
+    cur = con.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS samples (
+        sample_id TEXT PRIMARY KEY,
+        formulation TEXT,
+        batch TEXT
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS experiments (
+        experiment_id TEXT PRIMARY KEY,
+        sample_id TEXT NOT NULL,
+        measurement_type TEXT NOT NULL,
+        experiment_subtype TEXT,
+        source_label TEXT,
+        source_file TEXT,
+        raw_data_path TEXT,
+        processed_data_path TEXT,
+        fit_parameters_path TEXT,
+        parser TEXT,
+        parser_version TEXT,
+        source_hash TEXT,
+        ingested_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ingestion_log (
+        experiment_id TEXT PRIMARY KEY,
+        source_hash TEXT NOT NULL,
+        parser_version TEXT NOT NULL,
+        ingested_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS metrics_long (
+        experiment_id TEXT NOT NULL,
+        metric_name TEXT NOT NULL,
+        metric_value REAL,
+        PRIMARY KEY (experiment_id, metric_name)
+    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_experiments_sample ON experiments(sample_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_experiments_measurement ON experiments(measurement_type)")
+    con.commit()
+    con.close()
+
+
+def table_for_measurement(measurement_type: str) -> str:
+    m = re.sub(r"[^a-z0-9]+", "_", str(measurement_type).lower()).strip("_")
+    return f"points_{m or 'unknown'}"
+
+
+def upsert_experiment_to_sqlite(db_path: Path, experiment_row: dict, sample_row: dict, source_hash: str, parser_version: str,
+                                processed_df: Optional[pd.DataFrame], raw_df: Optional[pd.DataFrame], params_df: Optional[pd.DataFrame], metadata: dict) -> None:
+    con = sqlite3.connect(str(db_path))
+    cur = con.cursor()
+
+    cur.execute(
+        "INSERT INTO samples(sample_id, formulation, batch) VALUES(?,?,?) ON CONFLICT(sample_id) DO UPDATE SET formulation=excluded.formulation, batch=excluded.batch",
+        (sample_row.get("sample_id",""), sample_row.get("formulation",""), sample_row.get("batch",""))
+    )
+
+    cur.execute(
+        """INSERT INTO experiments(
+            experiment_id, sample_id, measurement_type, experiment_subtype, source_label, source_file,
+            raw_data_path, processed_data_path, fit_parameters_path, parser, parser_version, source_hash, ingested_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+        ON CONFLICT(experiment_id) DO UPDATE SET
+            sample_id=excluded.sample_id, measurement_type=excluded.measurement_type, experiment_subtype=excluded.experiment_subtype,
+            source_label=excluded.source_label, source_file=excluded.source_file, raw_data_path=excluded.raw_data_path,
+            processed_data_path=excluded.processed_data_path, fit_parameters_path=excluded.fit_parameters_path, parser=excluded.parser,
+            parser_version=excluded.parser_version, source_hash=excluded.source_hash, ingested_at=CURRENT_TIMESTAMP
+        """,
+        (experiment_row.get("experiment_id",""), experiment_row.get("sample_id",""), experiment_row.get("measurement_type",""),
+         experiment_row.get("experiment_subtype",""), experiment_row.get("source_label",""), experiment_row.get("source_file",""),
+         experiment_row.get("raw_data_path",""), experiment_row.get("processed_data_path",""), experiment_row.get("fit_parameters_path",""),
+         experiment_row.get("parser",""), parser_version, source_hash)
+    )
+
+    measurement_type = experiment_row.get("measurement_type", "")
+    points_table = table_for_measurement(measurement_type)
+    cols = []
+    df = processed_df if processed_df is not None and not processed_df.empty else raw_df
+    if df is not None and not df.empty:
+        cur.execute(f'DROP TABLE IF EXISTS "{points_table}"') if False else None
+        cols = [c for c in df.columns]
+        schema_cols = ", ".join([f'"{c}" REAL' for c in cols])
+        cur.execute(f'CREATE TABLE IF NOT EXISTS "{points_table}" (experiment_id TEXT NOT NULL, row_idx INTEGER NOT NULL, {schema_cols}, PRIMARY KEY(experiment_id,row_idx))')
+        cur.execute(f'DELETE FROM "{points_table}" WHERE experiment_id=?', (experiment_row.get("experiment_id",""),))
+        ins_cols = ', '.join([f'"{c}"' for c in cols])
+        placeholders = ', '.join(['?'] * (2 + len(cols)))
+        rows=[]
+        numeric_df = df.copy()
+        for c in cols:
+            numeric_df[c] = pd.to_numeric(numeric_df[c], errors='coerce')
+        for i, r in numeric_df.reset_index(drop=True).iterrows():
+            rows.append((experiment_row.get("experiment_id",""), int(i), *[None if pd.isna(v) else float(v) for v in r.tolist()]))
+        cur.executemany(f'INSERT OR REPLACE INTO "{points_table}" (experiment_id, row_idx, {ins_cols}) VALUES ({placeholders})', rows)
+
+    metrics = {}
+    if params_df is not None and not params_df.empty:
+        first = params_df.iloc[0]
+        for c,v in first.items():
+            try:
+                metrics[str(c)] = float(v)
+            except Exception:
+                pass
+    if isinstance(metadata, dict):
+        md = metadata.get('metadata', metadata) if isinstance(metadata.get('metadata', metadata), dict) else metadata
+        for c,v in md.items():
+            try:
+                metrics[f'metadata.{c}'] = float(v)
+            except Exception:
+                pass
+    cur.execute('DELETE FROM metrics_long WHERE experiment_id=?', (experiment_row.get("experiment_id",""),))
+    if metrics:
+        cur.executemany('INSERT OR REPLACE INTO metrics_long(experiment_id, metric_name, metric_value) VALUES (?,?,?)',
+                        [(experiment_row.get("experiment_id",""), k, v) for k,v in metrics.items()])
+
+    cur.execute('INSERT OR REPLACE INTO ingestion_log(experiment_id, source_hash, parser_version, ingested_at) VALUES (?,?,?,CURRENT_TIMESTAMP)',
+                (experiment_row.get("experiment_id",""), source_hash, parser_version))
+    con.commit(); con.close()
 
 def load_existing_manifests(out_root: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     manifests_dir = out_root / "manifests"
@@ -898,6 +1035,34 @@ class DataStandardizerApp:
 
         merged_samples_df = merge_sample_manifests(existing_samples, sample_manifest_rows)
         merged_samples_df.to_csv(manifests_dir / "samples.csv", index=False)
+
+        db_path = out_root / "lab_data.sqlite"
+        init_sqlite_database(db_path)
+        parser_version = "v1"
+        for rec in active:
+            experiment_id = str(rec.get("existing_experiment_id") or rec.get("experiment_id") or "").strip()
+            if not experiment_id:
+                continue
+            exp_row = final_experiment_rows.get(experiment_id, {}).copy()
+            if not exp_row:
+                continue
+            exp_row["parser"] = rec.get("parser", "")
+            source_path = Path(str(rec.get("source_file", "")))
+            source_hash = file_sha256(source_path) if source_path.exists() and source_path.is_file() else ""
+            metadata_doc = {
+                "metadata": rec.get("metadata", {}) if isinstance(rec.get("metadata"), dict) else {}
+            }
+            upsert_experiment_to_sqlite(
+                db_path=db_path,
+                experiment_row=exp_row,
+                sample_row={"sample_id": exp_row.get("sample_id", ""), "formulation": exp_row.get("formulation", ""), "batch": exp_row.get("batch", "")},
+                source_hash=source_hash,
+                parser_version=parser_version,
+                processed_df=rec.get("processed_df"),
+                raw_df=rec.get("raw_df"),
+                params_df=rec.get("params_df"),
+                metadata=metadata_doc,
+            )
 
         readme = out_root / "README_standardized_format.txt"
         readme.write_text(

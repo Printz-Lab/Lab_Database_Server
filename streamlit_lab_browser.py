@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -57,13 +58,25 @@ def normalize_path(base: Path, rel: Optional[str]) -> Optional[Path]:
 @st.cache_data(show_spinner=False)
 def load_manifests(root_str: str) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[str]]:
     root = Path(root_str).expanduser().resolve()
+    db_path = root / "lab_data.sqlite"
+
+    if db_path.exists():
+        try:
+            con = sqlite3.connect(str(db_path))
+            samples = pd.read_sql_query("SELECT * FROM samples", con).fillna("")
+            experiments = pd.read_sql_query("SELECT experiment_id, sample_id, measurement_type, experiment_subtype, source_label, source_file, raw_data_path, processed_data_path, fit_parameters_path FROM experiments", con).fillna("")
+            con.close()
+            return samples, experiments, None
+        except Exception as exc:
+            return pd.DataFrame(), pd.DataFrame(), f"SQLite load failed: {exc}"
+
     samples_path = root / "manifests" / "samples.csv"
     experiments_path = root / "manifests" / "experiments.csv"
 
     if not samples_path.exists() or not experiments_path.exists():
         return pd.DataFrame(), pd.DataFrame(), (
             f"Could not find manifest files at: {root / 'manifests'}\n"
-            "Expected both samples.csv and experiments.csv."
+            "Expected both samples.csv and experiments.csv, or lab_data.sqlite."
         )
 
     samples = pd.read_csv(samples_path).fillna("")
@@ -111,6 +124,30 @@ def load_json(path_str: str) -> Dict:
     except Exception:
         return {}
 
+
+
+@st.cache_data(show_spinner=False)
+def load_points_from_sqlite(root_str: str, measurement_type: str, experiment_id: str) -> Optional[pd.DataFrame]:
+    root = Path(root_str).expanduser().resolve()
+    db_path = root / "lab_data.sqlite"
+    if not db_path.exists():
+        return None
+    table = "points_" + "_".join([x for x in "".join([c.lower() if c.isalnum() else "_" for c in measurement_type]).split("_") if x])
+    if not table:
+        return None
+    con = sqlite3.connect(str(db_path))
+    try:
+        exists = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table' AND name=?", con, params=(table,))
+        if exists.empty:
+            return None
+        df = pd.read_sql_query(f'SELECT * FROM "{table}" WHERE experiment_id=? ORDER BY row_idx', con, params=(experiment_id,))
+        if df.empty:
+            return None
+        return df.drop(columns=[c for c in ["experiment_id", "row_idx"] if c in df.columns])
+    except Exception:
+        return None
+    finally:
+        con.close()
 
 # -----------------------------
 # Plot helpers
@@ -540,10 +577,12 @@ with tab1:
             fit_path = normalize_path(root_path, row.get("fit_parameters_path", ""))
 
             raw_df = load_csv(str(raw_path)) if raw_path else None
-            processed_df = load_csv(str(processed_path)) if processed_path else None
+            measurement_type = row["measurement_type"]
+            processed_df = load_points_from_sqlite(root_dir, measurement_type, chosen_experiment_id)
+            if processed_df is None:
+                processed_df = load_csv(str(processed_path)) if processed_path else None
             fit_df = load_csv(str(fit_path)) if fit_path else None
 
-            measurement_type = row["measurement_type"]
             pretty_name = f"{row['sample_id']} — {pretty_measurement_name(measurement_type)}"
             if str(row.get("experiment_subtype", "")).strip():
                 pretty_name += f" ({row['experiment_subtype']})"
@@ -687,8 +726,10 @@ with tab2:
         elif compare_mode == "Overlay curves":
             first_df = None
             for _, row in compare_pool.iterrows():
-                p = normalize_path(root_path, row.get("processed_data_path", ""))
-                df = load_csv(str(p)) if p else None
+                df = load_points_from_sqlite(root_dir, compare_measurement, row.get("experiment_id", ""))
+                if df is None:
+                    p = normalize_path(root_path, row.get("processed_data_path", ""))
+                    df = load_csv(str(p)) if p else None
                 if df is not None and not df.empty:
                     first_df = df
                     break
@@ -727,8 +768,10 @@ with tab2:
                 x_values = []
                 y_values = []
                 for _, row in compare_pool.iterrows():
-                    p = normalize_path(root_path, row.get("processed_data_path", ""))
-                    df = load_csv(str(p)) if p else None
+                    df = load_points_from_sqlite(root_dir, compare_measurement, row.get("experiment_id", ""))
+                    if df is None:
+                        p = normalize_path(root_path, row.get("processed_data_path", ""))
+                        df = load_csv(str(p)) if p else None
                     if df is None or df.empty or x_col not in df.columns or y_col not in df.columns:
                         skipped.append(row["experiment_id"])
                         continue

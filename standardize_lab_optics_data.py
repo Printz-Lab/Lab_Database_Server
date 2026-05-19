@@ -577,6 +577,131 @@ def detect_and_parse(path: Path) -> List[dict]:
 
 
 
+def build_record_from_existing_row(out_root: Path, row: pd.Series, sample_lookup: Dict[str, dict]) -> dict:
+    experiment_id = str(row.get("experiment_id", "")).strip()
+    exp_dir = out_root / "experiments" / experiment_id
+    metadata_path = exp_dir / "metadata.json"
+    metadata_json = json.load(open(str(metadata_path), "r", encoding="utf-8")) if metadata_path.exists() else {}
+    nested_metadata = metadata_json.get("metadata", {}) if isinstance(metadata_json.get("metadata", {}), dict) else {}
+
+    sample_id = str(row.get("sample_id", metadata_json.get("sample_id", ""))).strip()
+    sample_meta = sample_lookup.get(sample_id, {})
+    source_file_name = str(row.get("source_file", "")).strip()
+    source_file_value = str(out_root / source_file_name) if source_file_name else str(metadata_json.get("source_file", ""))
+
+    return {
+        "source_file": source_file_value,
+        "parser": metadata_json.get("parser", "loaded_manifest"),
+        "measurement_type": str(row.get("measurement_type", metadata_json.get("measurement_type", ""))).strip(),
+        "experiment_subtype": str(row.get("experiment_subtype", metadata_json.get("experiment_subtype", ""))).strip(),
+        "source_label": str(row.get("source_label", metadata_json.get("source_label", ""))).strip(),
+        "sample_guess": sample_id or clean_sample_name(row.get("source_label", "")),
+        "sample_id": sample_id,
+        "formulation": str(row.get("formulation", sample_meta.get("formulation", metadata_json.get("formulation", "")))).strip(),
+        "batch": str(row.get("batch", sample_meta.get("batch", metadata_json.get("batch", "")))).strip(),
+        "user_notes": str(row.get("notes", metadata_json.get("user_notes", ""))).strip(),
+        "raw_df": None,
+        "processed_df": None,
+        "params_df": None,
+        "metadata": nested_metadata,
+        "experiment_id": experiment_id,
+        "existing_experiment_id": experiment_id,
+        "loaded_from_database": True,
+        "db_existing_paths": {
+            "raw_data_path": str(row.get("raw_data_path", "")).strip(),
+            "processed_data_path": str(row.get("processed_data_path", "")).strip(),
+            "fit_parameters_path": str(row.get("fit_parameters_path", "")).strip(),
+        },
+    }
+
+
+def export_records(records: List[dict], out_root: Path) -> tuple[int, int, int]:
+    manifests_dir = out_root / "manifests"
+    experiments_dir = out_root / "experiments"
+    ensure_dir(manifests_dir)
+    ensure_dir(experiments_dir)
+    existing_experiments, existing_samples = load_existing_manifests(out_root)
+    existing_experiments = existing_experiments.fillna("") if existing_experiments is not None else pd.DataFrame()
+    existing_samples = existing_samples.fillna("") if existing_samples is not None else pd.DataFrame()
+    existing_rows_by_id: Dict[str, dict] = {}
+    if not existing_experiments.empty and "experiment_id" in existing_experiments.columns:
+        for _, row in existing_experiments.iterrows():
+            existing_rows_by_id[str(row.get("experiment_id", "")).strip()] = row.to_dict()
+    counters = build_existing_counter_map(existing_experiments)
+    existing_duplicate_keys = set()
+    if not existing_experiments.empty:
+        for _, row in existing_experiments.iterrows():
+            existing_duplicate_keys.add(make_duplicate_key(row.get("sample_id", ""), row.get("measurement_type", ""), row.get("experiment_subtype", ""), row.get("source_file", ""), row.get("source_label", "")))
+    final_experiment_rows: Dict[str, dict] = {k: v.copy() for k, v in existing_rows_by_id.items()}
+    sample_manifest_rows: List[dict] = []
+    added_count = 0
+    updated_count = 0
+    skipped_duplicates = 0
+    for rec in records:
+        sample_id = str(rec.get("sample_id", "")).strip()
+        if not sample_id:
+            continue
+        measurement_type = str(rec.get("measurement_type", "")).strip()
+        subtype = str(rec.get("experiment_subtype", "") or "default").strip()
+        source_file_name = Path(str(rec.get("source_file", ""))).name
+        source_label = str(rec.get("source_label", "")).strip()
+        existing_experiment_id = str(rec.get("existing_experiment_id") or rec.get("experiment_id") or "").strip()
+        if existing_experiment_id:
+            experiment_id = existing_experiment_id
+            existing_row = final_experiment_rows.get(experiment_id, existing_rows_by_id.get(experiment_id, {}))
+        else:
+            dup_key = make_duplicate_key(sample_id, measurement_type, subtype, source_file_name, source_label)
+            if dup_key in existing_duplicate_keys:
+                skipped_duplicates += 1
+                continue
+            key = f"{sample_id}__{measurement_type}"
+            counters[key] = counters.get(key, 0) + 1
+            experiment_id = f"{slugify(sample_id)}__{slugify(measurement_type)}__{counters[key]:03d}"
+            existing_row = {}
+            existing_duplicate_keys.add(dup_key)
+        exp_dir = experiments_dir / experiment_id
+        ensure_dir(exp_dir)
+        raw_rel = str(existing_row.get("raw_data_path", "") or rec.get("db_existing_paths", {}).get("raw_data_path", "")).strip() or None
+        processed_rel = str(existing_row.get("processed_data_path", "") or rec.get("db_existing_paths", {}).get("processed_data_path", "")).strip() or None
+        params_rel = str(existing_row.get("fit_parameters_path", "") or rec.get("db_existing_paths", {}).get("fit_parameters_path", "")).strip() or None
+        if rec.get("raw_df") is not None:
+            raw_rel = f"experiments/{experiment_id}/raw_data.csv"; rec["raw_df"].to_csv(out_root / raw_rel, index=False)
+        if rec.get("processed_df") is not None:
+            processed_rel = f"experiments/{experiment_id}/processed_data.csv"; rec["processed_df"].to_csv(out_root / processed_rel, index=False)
+        if rec.get("params_df") is not None:
+            params_rel = f"experiments/{experiment_id}/fit_parameters.csv"; rec["params_df"].to_csv(out_root / params_rel, index=False)
+        metadata_path = exp_dir / "metadata.json"
+        old_meta = json.load(open(str(metadata_path), "r", encoding="utf-8")) if metadata_path.exists() else {}
+        nested_metadata = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else old_meta.get("metadata", {})
+        metadata = {"experiment_id": experiment_id, "sample_id": sample_id, "measurement_type": measurement_type, "experiment_subtype": subtype, "source_label": source_label, "source_file": rec.get("source_file"), "parser": rec.get("parser", old_meta.get("parser")), "formulation": rec.get("formulation", old_meta.get("formulation", "")), "batch": rec.get("batch", old_meta.get("batch", "")), "user_notes": rec.get("user_notes", old_meta.get("user_notes", "")), "metadata": nested_metadata}
+        with open(metadata_path, "w", encoding="utf-8") as f: json.dump(metadata, f, indent=2)
+        final_experiment_rows[experiment_id] = {"experiment_id": experiment_id, "sample_id": sample_id, "measurement_type": measurement_type, "experiment_subtype": subtype, "source_label": source_label, "source_file": source_file_name, "raw_data_path": raw_rel or "", "processed_data_path": processed_rel or "", "fit_parameters_path": params_rel or "", "formulation": rec.get("formulation", ""), "batch": rec.get("batch", ""), "notes": rec.get("user_notes", "")}
+        sample_manifest_rows.append({"sample_id": sample_id, "formulation": rec.get("formulation", ""), "batch": rec.get("batch", "")})
+        if existing_experiment_id: updated_count += 1
+        else:
+            added_count += 1; rec["existing_experiment_id"] = experiment_id; rec["experiment_id"] = experiment_id
+    final_experiments_df = pd.DataFrame(list(final_experiment_rows.values()))
+    if not final_experiments_df.empty:
+        for col in ["experiment_id", "sample_id", "measurement_type", "experiment_subtype", "source_label", "source_file", "raw_data_path", "processed_data_path", "fit_parameters_path", "formulation", "batch", "notes"]:
+            if col not in final_experiments_df.columns: final_experiments_df[col] = ""
+        final_experiments_df = final_experiments_df.fillna("").sort_values(["sample_id", "measurement_type", "experiment_id"], kind="stable")
+    final_experiments_df.to_csv(manifests_dir / "experiments.csv", index=False)
+    merged_samples_df = merge_sample_manifests(existing_samples, sample_manifest_rows)
+    merged_samples_df.to_csv(manifests_dir / "samples.csv", index=False)
+    db_path = out_root / "lab_data.sqlite"; init_sqlite_database(db_path); parser_version = "v1"
+    for rec in records:
+        experiment_id = str(rec.get("existing_experiment_id") or rec.get("experiment_id") or "").strip()
+        if not experiment_id: continue
+        exp_row = final_experiment_rows.get(experiment_id, {}).copy()
+        if not exp_row: continue
+        exp_row["parser"] = rec.get("parser", "")
+        source_path = Path(str(rec.get("source_file", "")))
+        source_hash = file_sha256(source_path) if source_path.exists() and source_path.is_file() else ""
+        metadata_doc = {"metadata": rec.get("metadata", {}) if isinstance(rec.get("metadata"), dict) else {}}
+        upsert_experiment_to_sqlite(db_path, exp_row, {"sample_id": exp_row.get("sample_id", ""), "formulation": exp_row.get("formulation", ""), "batch": exp_row.get("batch", "")}, source_hash, parser_version, rec.get("processed_df"), rec.get("raw_df"), rec.get("params_df"), metadata_doc)
+    return added_count, updated_count, skipped_duplicates
+
+
 # -----------------------------
 # PySide6 GUI App (cross-platform)
 # -----------------------------

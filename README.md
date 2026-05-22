@@ -73,11 +73,22 @@ pip install -r requirements.txt
 
 ### Standardize Data
 
-python standardize_lab_optics_data_uvvis_append.py
+python standardize_lab_optics_data.py
+
+### GUI (cross-platform)
+
+The standardizer now uses a **PySide6 (Qt)** desktop GUI, which is compatible with Linux (including AlmaLinux + GNOME), macOS, and Windows.
+
+Use the app buttons to:
+- load an existing database
+- add files
+- edit sample metadata
+- choose output folder
+- export standardized data
 
 ### Launch App
 
-streamlit run streamlit_lab_browser_08042026.py
+streamlit run streamlit_lab_browser.py
 
 ---
 
@@ -103,7 +114,7 @@ LabDatabases/
 
 If Streamlit command fails:
 
-python -m streamlit run streamlit_lab_browser_08042026.py
+python -m streamlit run streamlit_lab_browser.py
 
 If data does not load:
 - Ensure manifests folder exists
@@ -122,3 +133,65 @@ If data does not load:
 ## Author
 Sean Raglow
 Internal lab tool
+
+
+## SQLite Database (Incremental + Idempotent)
+
+The exporter now builds/updates `lab_data.sqlite` in each database root.
+
+- Incremental updates: new experiments are appended without rebuilding existing tables.
+- Idempotent re-runs: existing experiment IDs are upserted and point rows are replaced only for that experiment.
+- Ingestion tracking: `ingestion_log` stores `experiment_id`, `source_hash`, `parser_version`, and ingest timestamp.
+- Plot data storage: measurement points are stored in per-type tables (`points_<measurement_type>`).
+
+Core SQLite tables:
+- `samples`
+- `experiments`
+- `metrics_long`
+- `ingestion_log`
+- `points_<measurement_type>` (created on demand)
+
+The Streamlit browser prefers SQLite for manifests and plotted points, and falls back to CSV files if needed.
+
+
+## Validating "acceptable data file examples"
+
+Use the **Validate example folder** button in the standardizer GUI to scan your examples folder and report:
+- files that are recognized by current parsers
+- files that are not yet implemented
+
+This makes it easy to confirm that every example format is supported before production use.
+
+## How to add new data types (JV, EQE, XRD, etc.)
+
+1. **Add a parser function** in `standardize_lab_optics_data.py`
+   - Create `parse_<type>_<format>(path: Path) -> List[dict]`.
+   - Return records with the same schema used by existing parsers:
+     - `measurement_type` (e.g. `jv_curve`, `eqe_spectrum`)
+     - `experiment_subtype`
+     - `sample_guess`, `source_label`, `source_file`
+     - `raw_df`, `processed_df`, optional `params_df`, and `metadata`
+
+2. **Register detection logic** in `detect_and_parse(path)`
+   - Add format checks (sheet names / filename patterns / CSV columns).
+   - Route recognized files to your new parser.
+
+3. **Keep tabular numeric columns in `processed_df`**
+   - The exporter stores per-experiment points into SQLite `points_<measurement_type>`.
+   - The browser can then plot from SQLite directly.
+
+4. **(Optional) Add display defaults in browser**
+   - In `streamlit_lab_browser.py`, extend `MEASUREMENT_CONFIG` with:
+     - `pretty_name`
+     - `default_x`
+     - `default_y`
+   - This improves auto-selected axes/series for the new type.
+
+5. **Validate with example files**
+   - Put representative files in your examples folder.
+   - Run the GUI button **Validate example folder** and ensure unsupported count is zero.
+
+6. **Export once to materialize new tables**
+   - On export, new `measurement_type` values automatically create/update SQLite tables:
+     - `points_<measurement_type>`
+   - Existing experiments remain intact (incremental/idempotent behavior).

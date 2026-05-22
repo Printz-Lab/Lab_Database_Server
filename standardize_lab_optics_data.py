@@ -555,6 +555,28 @@ def parse_uvvis_excel(path: Path) -> List[dict]:
     return outputs
 
 
+
+
+def validate_example_folder(folder: Path) -> tuple[List[str], List[str]]:
+    supported: List[str] = []
+    unsupported: List[str] = []
+    if not folder.exists() or not folder.is_dir():
+        return supported, unsupported
+    for path in sorted(folder.rglob('*')):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in {'.csv', '.xlsx', '.xls', '.xlsm'}:
+            continue
+        try:
+            parsed = detect_and_parse(path)
+            if parsed:
+                supported.append(str(path))
+            else:
+                unsupported.append(str(path))
+        except Exception:
+            unsupported.append(str(path))
+    return supported, unsupported
+
 def detect_and_parse(path: Path) -> List[dict]:
     suffix = path.suffix.lower()
     if suffix == ".csv":
@@ -727,8 +749,9 @@ class DataStandardizerApp(QtWidgets.QMainWindow):
         self.btn_remove = QtWidgets.QPushButton("Remove selected")
         self.btn_autofill = QtWidgets.QPushButton("Autofill sample IDs")
         self.btn_choose_out = QtWidgets.QPushButton("Choose output folder")
+        self.btn_validate_examples = QtWidgets.QPushButton("Validate example folder")
         self.btn_export = QtWidgets.QPushButton("Export standardized data")
-        for b in [self.btn_load, self.btn_add, self.btn_remove, self.btn_autofill, self.btn_choose_out, self.btn_export]:
+        for b in [self.btn_load, self.btn_add, self.btn_remove, self.btn_autofill, self.btn_choose_out, self.btn_validate_examples, self.btn_export]:
             top.addWidget(b)
         root.addLayout(top)
 
@@ -788,6 +811,7 @@ Export standardized data:
         self.btn_autofill.clicked.connect(self.autofill_sample_ids)
         self.btn_choose_out.clicked.connect(self.choose_output_dir)
         self.btn_export.clicked.connect(self.export_all)
+        self.btn_validate_examples.clicked.connect(self.validate_examples)
         self.btn_load.clicked.connect(self.load_existing_database)
         self.btn_apply.clicked.connect(self.apply_to_selected)
         self.btn_clear.clicked.connect(self.clear_form)
@@ -903,6 +927,24 @@ Export standardized data:
         self.out_edit.setText(str(out_root)); self.refresh_table()
         self.set_status(f"Loaded {added} existing experiment record(s) from {out_root}.")
         QtWidgets.QMessageBox.information(self, APP_TITLE, f"Loaded {added} experiment record(s).\nSkipped duplicates: {skipped}")
+
+
+    def validate_examples(self):
+        chosen = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose acceptable data file examples folder", str(Path.cwd()))
+        if not chosen:
+            return
+        folder = Path(chosen).expanduser().resolve()
+        supported, unsupported = validate_example_folder(folder)
+        msg = [
+            f"Scanned: {folder}",
+            f"Supported files: {len(supported)}",
+            f"Unsupported files: {len(unsupported)}",
+        ]
+        if unsupported:
+            msg.append("\nUnsupported files:\n- " + "\n- ".join(unsupported[:25]))
+            if len(unsupported) > 25:
+                msg.append(f"\n... and {len(unsupported)-25} more")
+        QtWidgets.QMessageBox.information(self, APP_TITLE, "\n".join(msg))
 
     def export_all(self):
         records = [r for r in self.records if not r.get("_removed")]
